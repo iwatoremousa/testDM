@@ -1,0 +1,100 @@
+name: Dead man's switch
+
+# Makes this repository public once the timestamp in deadline.txt has passed.
+# To postpone: commit a later timestamp to deadline.txt before then.
+#
+# deadline.txt format (timezone is required), e.g.:
+#   2027-01-01T18:30+03:00
+#   2027-01-01T15:30Z
+
+on:
+  schedule:
+    - cron: "7 * * * *"      # hourly; GitHub may start runs several minutes late
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only report what would happen, do not change visibility"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadman-switch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check deadline and publish if it has passed
+        env:
+          GH_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Secret REPO_ADMIN_TOKEN is not set."
+            exit 1
+          fi
+
+          pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+
+          # Prints the deadline as epoch seconds, reading from stdin
+          parse_deadline() {
+            local raw
+            raw="$(tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if ! [[ "$raw" =~ $pattern ]]; then
+              echo "::error::deadline.txt must look like 2027-01-01T18:30+03:00 (got '$raw')." >&2
+              return 1
+            fi
+            date -d "$raw" +%s
+          }
+
+          visibility="$(gh api "repos/$REPO" --jq .visibility)"
+          if [ "$visibility" = "public" ]; then
+            echo "Already public. Nothing to do."
+            exit 0
+          fi
+
+          deadline_epoch="$(parse_deadline < deadline.txt)"
+          now="$(date +%s)"
+          remaining=$(( deadline_epoch - now ))
+          echo "Now: $(date -u -Is) | Deadline: $(date -u -d @"$deadline_epoch" -Is) | Seconds left: $remaining"
+
+          if [ "$remaining" -gt 3900 ]; then
+            echo "Deadline is more than ~65 minutes away. Staying private."
+            exit 0
+          fi
+
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            if [ "$remaining" -gt 0 ]; then
+              echo "DRY RUN: would wait $remaining s, then make the repository public."
+            else
+              echo "DRY RUN: deadline passed, would make the repository public now."
+            fi
+            exit 0
+          fi
+
+          if [ "$remaining" -gt 0 ]; then
+            echo "Waiting $remaining s until the deadline."
+            sleep "$remaining"
+
+            # The deadline may have been postponed while we were waiting.
+            git fetch --depth=1 origin HEAD
+            fresh_epoch="$(git show FETCH_HEAD:deadline.txt | parse_deadline)"
+            if [ "$fresh_epoch" -gt "$(date +%s)" ]; then
+              echo "deadline.txt was updated to $(date -u -d @"$fresh_epoch" -Is). Staying private."
+              exit 0
+            fi
+          fi
+
+          echo "Deadline passed. Making repository public."
+          gh api -X PATCH "repos/$REPO" -f visibility=public >/dev/null
+          echo "Done: $(gh api "repos/$REPO" --jq .visibility)"
